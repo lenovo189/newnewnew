@@ -2,3 +2,5 @@ pyrogram
 tgcrypto
 supabase
 python-dotenv
+fastapi
+uvicorn
