@@ -5,7 +5,7 @@ from supabase import create_client, Client as SupabaseClient
 import os
 import uvicorn
 from dotenv import load_dotenv
-
+import requests
 # Load environment variables
 load_dotenv(dotenv_path=".env.local")
 
@@ -257,14 +257,25 @@ async def handle_all_text(client, message: Message):
 
 @app.on_event("startup")
 async def on_startup():
-    # Back to native standard startup
+    # Start the Pyrogram client instance natively
     await bot.start()
+    
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        await bot.set_webhook(webhook_url)
-        print(f"🚀 Webhook configured to: {webhook_url}")
+        
+        # Seamlessly set the webhook via Telegram's direct HTTP Bot API
+        telegram_api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}"
+        
+        try:
+            response = requests.get(telegram_api_url)
+            if response.status_code == 200 and response.json().get("ok"):
+                print(f"🚀 Webhook successfully configured to: {webhook_url}")
+            else:
+                print(f"❌ Failed to set webhook via HTTP API: {response.text}")
+        except Exception as e:
+            print(f"❌ Error while connecting to Telegram API: {e}")
     else:
-        print("⚠️ RENDER_EXTERNAL_URL not found.")
+        print("⚠️ RENDER_EXTERNAL_URL environment variable not found.")
 
 @app.on_event("shutdown")
 async def on_shutdown():
