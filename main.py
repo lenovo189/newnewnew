@@ -262,8 +262,8 @@ async def handle_all_text(client, message: Message):
     except Exception as e:
         await message.reply_text("❌ Qidiruvda xatolik yuz berdi.")
 
-@app.on_event("startup")
-async def on_startup():
+async def run_bot_async():
+    """Runs Pyrogram safely isolated inside a proper asyncio Task framework."""
     await bot.start()
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
@@ -271,6 +271,11 @@ async def on_startup():
         print(f"🚀 Webhook configured to: {webhook_url}")
     else:
         print("⚠️ RENDER_EXTERNAL_URL not found.")
+
+@app.on_event("startup")
+async def on_startup():
+    # Spawns the startup engine inside a correct asyncio Task structure
+    asyncio.create_task(run_bot_async())
 
 @app.on_event("shutdown")
 async def on_shutdown():
