@@ -1,3 +1,10 @@
+import asyncio
+import nest_asyncio
+
+# Apply the patch immediately before any other async imports
+nest_asyncio.apply()
+
+# Now import the rest of your libraries safely
 from fastapi import FastAPI, Request, Response
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Update
@@ -16,7 +23,7 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "0"))
 SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
 SUPABASE_KEY = os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") # Render automatically provides this
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # Admin state tracking
 admin_states = {}
@@ -183,26 +190,94 @@ async def cancel_flow(client, message: Message):
         admin_states[user_id]["step"] = "menu"
         await message.reply_text("🛑 Bekor qilindi. Admin menyusiga qaytilmoqda.")
 
+@bot.on_message(filters.text & ~filters.command([]))
+async def handle_all_text(client, message: Message):
+    user_id = message.from_user.id
+    state = admin_states.get(user_id)
+    text = message.text.strip()
+
+    if state and state.get("step") != "menu":
+        step = state.get("step")
+        if step == "awaiting_title":
+            state["title"] = text
+            state["step"] = "awaiting_post_link"
+            await message.reply_text(f"✅ Nom o'rnatildi: **{text}**\n\n2-bosqich: Post linkini yuboring (masalan: https://t.me/channel/1)")
+        
+        elif step == "awaiting_post_link":
+            msg_id = parse_tg_link(text)
+            if msg_id:
+                state["post_message_id"] = msg_id
+                state["telegram_post_url"] = text
+                state["step"] = "awaiting_sample_link"
+                await message.reply_text(f"✅ Post linki qabul qilindi (ID: {msg_id})\n\n3-bosqich: Namuna video linkini yuboring (yoki 'yo'q' deb yozing)")
+            else:
+                await message.reply_text("❌ Link formati noto'g'ri. Iltimos shunday link yuboring: `https://t.me/channel/123`")
+        
+        elif step == "awaiting_sample_link":
+            if text.lower() in ['yo\'q', "yo'q", 'none', 'yoq']:
+                state["sample_message_id"] = None
+                state["step"] = "awaiting_mkv_link"
+                await message.reply_text("⏩ Namuna o'tkazib yuborildi.\n\n4-bosqich: Asosiy video (MKV) linkini yuboring")
+            else:
+                msg_id = parse_tg_link(text)
+                if msg_id:
+                    state["sample_message_id"] = msg_id
+                    state["step"] = "awaiting_mkv_link"
+                    await message.reply_text(f"✅ Namuna linki qabul qilindi (ID: {msg_id})\n\n4-bosqich: Asosiy video (MKV) linkini yuboring")
+                else:
+                    await message.reply_text("❌ Link formati noto'g'ri.")
+
+        elif step == "awaiting_mkv_link":
+            msg_id = parse_tg_link(text)
+            if msg_id:
+                state["telegram_message_id"] = msg_id
+                try:
+                    movie_data = {
+                        "title": state["title"],
+                        "telegram_message_id": state["telegram_message_id"],
+                        "post_message_id": state.get("post_message_id"),
+                        "sample_message_id": state.get("sample_message_id"),
+                        "telegram_post_url": state.get("telegram_post_url"),
+                        "status": "published"
+                    }
+                    supabase.table("movies").insert(movie_data).execute()
+                    await message.reply_text(f"🎉 **Muvaffaqiyatli!** '**{state['title']}**' filmi qo'shildi va e'lon qilindi.")
+                    state["step"] = "menu"
+                except Exception as e:
+                    await message.reply_text(f"❌ Ma'lumotlar bazasiga saqlashda xatolik: {e}")
+            else:
+                await message.reply_text("❌ Link formati noto'g'ri.")
+        return
+
+    # User qidiruv logikasi
+    user_query = text
+    await message.reply_text(f"🔍 **{user_query}** qidirilmoqda...")
+    try:
+        response = supabase.table("movies").select("*").ilike("title", f"%{user_query}%").eq("status", "published").execute()
+        movies = response.data
+        if movies:
+            await send_movie_package(bot, message.chat.id, movies[0])
+        else:
+            await message.reply_text("🔍 Film topilmadi. Mavjud filmlarni ko'rish uchun /list bosing.")
+    except Exception as e:
+        await message.reply_text("❌ Qidiruvda xatolik yuz berdi.")
+
 @app.on_event("startup")
 async def on_startup():
-    """Starts the Pyrogram client session and binds webhook to Telegram on startup."""
     await bot.start()
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        # Set Telegram webhook via Pyrogram's underlying invoke or simple client logic
         await bot.set_webhook(webhook_url)
         print(f"🚀 Webhook configured to: {webhook_url}")
     else:
-        print("⚠️ RENDER_EXTERNAL_URL not found. Webhook could not be automatically set.")
+        print("⚠️ RENDER_EXTERNAL_URL not found.")
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    """Safely closes Pyrogram session on app teardown."""
     await bot.stop()
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    """Listens to incoming POST updates from Telegram and feeds them into Pyrogram."""
     try:
         json_data = await request.json()
         update = Update.read(json_data)
@@ -216,6 +291,5 @@ async def root():
     return {"status": "healthy", "bot": "CineStream"}
 
 if __name__ == "__main__":
-    # Pulls dynamic port assigned by Render, defaults to 8000 locally
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main.py:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
