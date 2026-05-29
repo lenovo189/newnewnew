@@ -1,44 +1,46 @@
+from fastapi import FastAPI, Request, Response
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Update
 from supabase import create_client, Client as SupabaseClient
 import os
+import uvicorn
 from dotenv import load_dotenv
 
-# Load environment variables from .env.local
+# Load environment variables
 load_dotenv(dotenv_path=".env.local")
 
-# --- CONFIGURATION (SECURED VIA ENV VARS) ---
+# --- CONFIGURATION ---
 API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
 API_HASH = os.getenv("TELEGRAM_API_HASH")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "0"))
 SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
 SUPABASE_KEY = os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL") # Render automatically provides this
 
 # Admin state tracking
 admin_states = {}
 
 def parse_tg_link(link: str):
-    """Telegrams linkidan xabar ID-sini ajratib oladi: https://t.me/channel/123"""
     try:
         parts = link.strip().split('/')
         return int(parts[-1])
     except:
         return None
 
-# Initialize Supabase
+# Initialize Supabase & Pyrogram Client
 supabase: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_KEY)
+bot = Client("movie_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, plugins=None)
 
-# Initializing Pyrogram safely using the production env vars
-app = Client("movie_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Initialize FastAPI
+app = FastAPI()
 
 MOVIES_PER_PAGE = 10
 
+# --- PYPROGRAM HANDLERS ---
+
 def get_movies_markup(page: int, total_count: int, movies: list):
-    """Katalog uchun inline klaviatura yaratadi."""
     buttons = []
-    
-    # 1. Tanlov tugmalari (raqamlar)
     row = []
     for i in range(len(movies)):
         row.append(InlineKeyboardButton(str(i + 1), callback_data=f"select_{movies[i]['id']}"))
@@ -47,33 +49,28 @@ def get_movies_markup(page: int, total_count: int, movies: list):
             row = []
     if row: buttons.append(row)
 
-    # 2. Navigatsiya tugmalari
     nav_row = []
     if page > 0:
         nav_row.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"page_{page-1}"))
     if (page + 1) * MOVIES_PER_PAGE < total_count:
         nav_row.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"page_{page+1}"))
-    
     if nav_row:
         buttons.append(nav_row)
-    
     return InlineKeyboardMarkup(buttons)
 
-@app.on_message(filters.command("start"))
+@bot.on_message(filters.command("start"))
 async def start_command(client, message: Message):
     await message.reply_text(
         "👋 CineStream Botiga xush kelibsiz!\n\n"
         "Qidirish uchun film nomini yuboring yoki mavjud filmlarni ko'rish uchun /list bosing."
     )
 
-@app.on_message(filters.command("list"))
+@bot.on_message(filters.command("list"))
 async def list_movies(client, message: Message, page: int = 0):
     try:
-        # Umumiy sonini olish
         count_res = supabase.table("movies").select("id", count="exact").eq("status", "published").execute()
         total_count = count_res.count if count_res.count is not None else 0
         
-        # Sahifalangan filmlarni olish
         offset = page * MOVIES_PER_PAGE
         response = supabase.table("movies").select("id, title").eq("status", "published").order("created_at", desc=True).range(offset, offset + MOVIES_PER_PAGE - 1).execute()
         movies = response.data
@@ -87,14 +84,12 @@ async def list_movies(client, message: Message, page: int = 0):
             movie_text += f"{i + 1}. **{movie['title']}**\n"
         
         movie_text += "\nKo'rish uchun raqamni tanlang yoki boshqalarni ko'rish uchun o'qlardan foydalaning:"
-        
         markup = get_movies_markup(page, total_count, movies)
         await message.reply_text(movie_text, reply_markup=markup)
     except Exception as e:
         await message.reply_text("❌ Katalogni yuklashda xatolik yuz berdi.")
-        print(f"List Error: {e}")
 
-@app.on_callback_query(filters.regex("^page_"))
+@bot.on_callback_query(filters.regex("^page_"))
 async def handle_pagination(client, callback_query: CallbackQuery):
     page = int(callback_query.data.split("_")[1])
     try:
@@ -115,34 +110,19 @@ async def handle_pagination(client, callback_query: CallbackQuery):
         await callback_query.answer("Sahifani yuklab bo'lmadi.")
 
 async def send_movie_package(client, chat_id, movie):
-    """Postni va keyin ko'rish/namuna tugmalarini yuboradi."""
-    # 1. Postni forward qilish
     if movie.get("post_message_id"):
-        await client.forward_messages(
-            chat_id=chat_id,
-            from_chat_id=CHANNEL_ID,
-            message_ids=int(movie["post_message_id"])
-        )
+        await client.forward_messages(chat_id=chat_id, from_chat_id=CHANNEL_ID, message_ids=int(movie["post_message_id"]))
     
-    # 2. Tugmalarni yaratish
     buttons = []
-    
-    # Both are now callbacks for forwarding
     if movie.get("telegram_message_id"):
         buttons.append([InlineKeyboardButton("📺 To'liq ko'rish (MKV)", callback_data=f"full_{movie['id']}")])
-    
     if movie.get("sample_message_id"):
         buttons.append([InlineKeyboardButton("🎞 Namunani ko'rish", callback_data=f"sample_{movie['id']}")])
     
     markup = InlineKeyboardMarkup(buttons)
-    
-    await client.send_message(
-         chat_id=chat_id,
-         text=f"🍿 **{movie['title']}**\n\nQuyidagi variantlardan birini tanlang:",
-         reply_markup=markup
-    )
+    await client.send_message(chat_id=chat_id, text=f"🍿 **{movie['title']}**\n\nQuyidagi variantlardan birini tanlang:", reply_markup=markup)
 
-@app.on_callback_query(filters.regex("^select_"))
+@bot.on_callback_query(filters.regex("^select_"))
 async def handle_selection(client, callback_query: CallbackQuery):
     movie_id = callback_query.data.split("_")[1]
     await callback_query.answer("Tayyorlanmoqda...")
@@ -154,7 +134,7 @@ async def handle_selection(client, callback_query: CallbackQuery):
     except Exception as e:
         print(f"Selection Error: {e}")
 
-@app.on_callback_query(filters.regex("^full_"))
+@bot.on_callback_query(filters.regex("^full_"))
 async def handle_full_request(client, callback_query: CallbackQuery):
     movie_id = callback_query.data.split("_")[1]
     await callback_query.answer("Film yuborilmoqda...")
@@ -162,15 +142,11 @@ async def handle_full_request(client, callback_query: CallbackQuery):
         response = supabase.table("movies").select("telegram_message_id").eq("id", movie_id).single().execute()
         movie = response.data
         if movie and movie.get("telegram_message_id"):
-            await client.forward_messages(
-                chat_id=callback_query.message.chat.id,
-                from_chat_id=CHANNEL_ID,
-                message_ids=int(movie["telegram_message_id"])
-            )
+            await client.forward_messages(chat_id=callback_query.message.chat.id, from_chat_id=CHANNEL_ID, message_ids=int(movie["telegram_message_id"]))
     except Exception as e:
         print(f"Full Video Error: {e}")
 
-@app.on_callback_query(filters.regex("^sample_"))
+@bot.on_callback_query(filters.regex("^sample_"))
 async def handle_sample_request(client, callback_query: CallbackQuery):
     movie_id = callback_query.data.split("_")[1]
     await callback_query.answer("Namuna yuborilmoqda...")
@@ -178,15 +154,11 @@ async def handle_sample_request(client, callback_query: CallbackQuery):
         response = supabase.table("movies").select("sample_message_id").eq("id", movie_id).single().execute()
         movie = response.data
         if movie and movie.get("sample_message_id"):
-            await client.forward_messages(
-                chat_id=callback_query.message.chat.id,
-                from_chat_id=CHANNEL_ID,
-                message_ids=int(movie["sample_message_id"])
-            )
+            await client.forward_messages(chat_id=callback_query.message.chat.id, from_chat_id=CHANNEL_ID, message_ids=int(movie["sample_message_id"]))
     except Exception as e:
         print(f"Sample Error: {e}")
 
-@app.on_message(filters.command("admin"))
+@bot.on_message(filters.command("admin"))
 async def admin_cmd(client, message: Message):
     args = message.text.split()
     if len(args) > 1 and args[1] == os.getenv("ADMIN_PASSWORD"):
@@ -195,95 +167,55 @@ async def admin_cmd(client, message: Message):
     else:
         await message.reply_text("❌ Ruxsat berilmadi. Foydalanish: `/admin parolingiz`")
 
-@app.on_message(filters.command("addmovie"))
+@bot.on_message(filters.command("addmovie"))
 async def add_movie_start(client, message: Message):
     user_id = message.from_user.id
     if user_id not in admin_states or not admin_states[user_id].get("is_admin"):
         await message.reply_text("❌ Avval /admin parolingiz orqali tizimga kiring.")
         return
-
     admin_states[user_id]["step"] = "awaiting_title"
     await message.reply_text("📝 **Film qo'shish**\n\n1-bosqich: Film nomini yuboring (masalan: 'Avatar')")
 
-@app.on_message(filters.command("cancel"))
+@bot.on_message(filters.command("cancel"))
 async def cancel_flow(client, message: Message):
     user_id = message.from_user.id
     if user_id in admin_states:
         admin_states[user_id]["step"] = "menu"
         await message.reply_text("🛑 Bekor qilindi. Admin menyusiga qaytilmoqda.")
 
-@app.on_message(filters.text & ~filters.command([]))
-async def handle_all_text(client, message: Message):
-    user_id = message.from_user.id
-    state = admin_states.get(user_id)
-    text = message.text.strip()
+@app.on_event("startup")
+async def on_startup():
+    """Starts the Pyrogram client session and binds webhook to Telegram on startup."""
+    await bot.start()
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+        # Set Telegram webhook via Pyrogram's underlying invoke or simple client logic
+        await bot.set_webhook(webhook_url)
+        print(f"🚀 Webhook configured to: {webhook_url}")
+    else:
+        print("⚠️ RENDER_EXTERNAL_URL not found. Webhook could not be automatically set.")
 
-    if state and state.get("step") != "menu":
-        step = state.get("step")
-        if step == "awaiting_title":
-            state["title"] = text
-            state["step"] = "awaiting_post_link"
-            await message.reply_text(f"✅ Nom o'rnatildi: **{text}**\n\n2-bosqich: Post linkini yuboring (masalan: https://t.me/channel/1)")
-        
-        elif step == "awaiting_post_link":
-            msg_id = parse_tg_link(text)
-            if msg_id:
-                state["post_message_id"] = msg_id
-                state["telegram_post_url"] = text
-                state["step"] = "awaiting_sample_link"
-                await message.reply_text(f"✅ Post linki qabul qilindi (ID: {msg_id})\n\n3-bosqich: Namuna video linkini yuboring (yoki 'yo'q' deb yozing)")
-            else:
-                await message.reply_text("❌ Link formati noto'g'ri. Iltimos shunday link yuboring: `https://t.me/channel/123`")
-        
-        elif step == "awaiting_sample_link":
-            if text.lower() in ['yo\'q', "yo'q", 'none', 'yoq']:
-                state["sample_message_id"] = None
-                state["step"] = "awaiting_mkv_link"
-                await message.reply_text("⏩ Namuna o'tkazib yuborildi.\n\n4-bosqich: Asosiy video (MKV) linkini yuboring")
-            else:
-                msg_id = parse_tg_link(text)
-                if msg_id:
-                    state["sample_message_id"] = msg_id
-                    state["step"] = "awaiting_mkv_link"
-                    await message.reply_text(f"✅ Namuna linki qabul qilindi (ID: {msg_id})\n\n4-bosqich: Asosiy video (MKV) linkini yuboring")
-                else:
-                    await message.reply_text("❌ Link formati noto'g'ri.")
+@app.on_event("shutdown")
+async def on_shutdown():
+    """Safely closes Pyrogram session on app teardown."""
+    await bot.stop()
 
-        elif step == "awaiting_mkv_link":
-            msg_id = parse_tg_link(text)
-            if msg_id:
-                state["telegram_message_id"] = msg_id
-                try:
-                    movie_data = {
-                        "title": state["title"],
-                        "telegram_message_id": state["telegram_message_id"],
-                        "post_message_id": state.get("post_message_id"),
-                        "sample_message_id": state.get("sample_message_id"),
-                        "telegram_post_url": state.get("telegram_post_url"),
-                        "status": "published"
-                    }
-                    supabase.table("movies").insert(movie_data).execute()
-                    await message.reply_text(f"🎉 **Muvaffaqiyatli!** '**{state['title']}**' filmi qo'shildi va e'lon qilindi.")
-                    state["step"] = "menu"
-                except Exception as e:
-                    await message.reply_text(f"❌ Ma'lumotlar bazasiga saqlashda xatolik: {e}")
-            else:
-                await message.reply_text("❌ Link formati noto'g'ri.")
-        return
-
-    # User qidiruv logikasi
-    user_query = text
-    await message.reply_text(f"🔍 **{user_query}** qidirilmoqda...")
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    """Listens to incoming POST updates from Telegram and feeds them into Pyrogram."""
     try:
-        response = supabase.table("movies").select("*").ilike("title", f"%{user_query}%").eq("status", "published").execute()
-        movies = response.data
-        if movies:
-            await send_movie_package(client, message.chat.id, movies[0])
-        else:
-            await message.reply_text("🔍 Film topilmadi. Mavjud filmlarni ko'rish uchun /list bosing.")
+        json_data = await request.json()
+        update = Update.read(json_data)
+        await bot.check_update(update)
     except Exception as e:
-        await message.reply_text("❌ Qidiruvda xatolik yuz berdi.")
+        print(f"Webhook processing error: {e}")
+    return Response(status_code=200)
+
+@app.get("/")
+async def root():
+    return {"status": "healthy", "bot": "CineStream"}
 
 if __name__ == "__main__":
-    print("CineStream Bot ishga tushdi...")
-    app.run()
+    # Pulls dynamic port assigned by Render, defaults to 8000 locally
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main.py:app", host="0.0.0.0", port=port, reload=False)
