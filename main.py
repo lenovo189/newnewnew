@@ -1,10 +1,3 @@
-import asyncio
-import nest_asyncio
-
-# Apply the patch immediately before any other async imports
-nest_asyncio.apply()
-
-# Now import the rest of your libraries safely
 from fastapi import FastAPI, Request, Response
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Update
@@ -262,8 +255,9 @@ async def handle_all_text(client, message: Message):
     except Exception as e:
         await message.reply_text("❌ Qidiruvda xatolik yuz berdi.")
 
-async def run_bot_async():
-    """Runs Pyrogram safely isolated inside a proper asyncio Task framework."""
+@app.on_event("startup")
+async def on_startup():
+    # Back to native standard startup
     await bot.start()
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
@@ -271,11 +265,6 @@ async def run_bot_async():
         print(f"🚀 Webhook configured to: {webhook_url}")
     else:
         print("⚠️ RENDER_EXTERNAL_URL not found.")
-
-@app.on_event("startup")
-async def on_startup():
-    # Spawns the startup engine inside a correct asyncio Task structure
-    asyncio.create_task(run_bot_async())
 
 @app.on_event("shutdown")
 async def on_shutdown():
