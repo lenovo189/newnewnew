@@ -1,38 +1,53 @@
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from supabase import create_client, Client as SupabaseClient
+import asyncio
 import os
 from dotenv import load_dotenv
+from fastapi import FastAPI, Request, Response
+import uvicorn
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message, CallbackQuery,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.filters import Command
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+from supabase import create_client, Client as SupabaseClient
 
 load_dotenv(dotenv_path=".env.local")
 
 # --- CONFIGURATION ---
-API_ID = int(os.getenv("TELEGRAM_API_ID", "0"))
-API_HASH = os.getenv("TELEGRAM_API_HASH")
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "0"))
 SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL")
 SUPABASE_KEY = os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+WEBHOOK_PATH = "/webhook"
+MOVIES_PER_PAGE = 10
+
+# --- INIT ---
+supabase: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_KEY)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+dp = Dispatcher()
+app = FastAPI()
 
 admin_states = {}
 
+# --- HELPERS ---
 def parse_tg_link(link: str):
     try:
-        parts = link.strip().split('/')
-        return int(parts[-1])
+        return int(link.strip().split('/')[-1])
     except:
         return None
 
-supabase: SupabaseClient = create_client(SUPABASE_URL, SUPABASE_KEY)
-bot = Client("movie_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-MOVIES_PER_PAGE = 10
-
-def get_movies_markup(page: int, total_count: int, movies: list):
+def get_movies_markup(page: int, total_count: int, movies: list) -> InlineKeyboardMarkup:
     buttons = []
     row = []
-    for i in range(len(movies)):
-        row.append(InlineKeyboardButton(str(i + 1), callback_data=f"select_{movies[i]['id']}"))
+    for i, movie in enumerate(movies):
+        row.append(InlineKeyboardButton(text=str(i + 1), callback_data=f"select_{movie['id']}"))
         if len(row) == 5:
             buttons.append(row)
             row = []
@@ -41,53 +56,100 @@ def get_movies_markup(page: int, total_count: int, movies: list):
 
     nav_row = []
     if page > 0:
-        nav_row.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"page_{page-1}"))
+        nav_row.append(InlineKeyboardButton(text="⬅️ Oldingi", callback_data=f"page_{page - 1}"))
     if (page + 1) * MOVIES_PER_PAGE < total_count:
-        nav_row.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"page_{page+1}"))
+        nav_row.append(InlineKeyboardButton(text="Keyingi ➡️", callback_data=f"page_{page + 1}"))
     if nav_row:
         buttons.append(nav_row)
-    return InlineKeyboardMarkup(buttons)
 
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-@bot.on_message(filters.command("start"))
-async def start_command(client, message: Message):
-    await message.reply_text(
+async def send_movie_package(chat_id: int, movie: dict):
+    if movie.get("post_message_id"):
+        await bot.forward_message(chat_id=chat_id, from_chat_id=CHANNEL_ID, message_id=int(movie["post_message_id"]))
+
+    buttons = []
+    if movie.get("telegram_message_id"):
+        buttons.append([InlineKeyboardButton(text="📺 To'liq ko'rish (MKV)", callback_data=f"full_{movie['id']}")])
+    if movie.get("sample_message_id"):
+        buttons.append([InlineKeyboardButton(text="🎞 Namunani ko'rish", callback_data=f"sample_{movie['id']}")])
+
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await bot.send_message(chat_id=chat_id, text=f"🍿 **{movie['title']}**\n\nQuyidagi variantlardan birini tanlang:", reply_markup=markup)
+
+# --- COMMAND HANDLERS ---
+
+@dp.message(Command("start"))
+async def start_command(message: Message):
+    await message.answer(
         "👋 CineStream Botiga xush kelibsiz!\n\n"
         "Qidirish uchun film nomini yuboring yoki mavjud filmlarni ko'rish uchun /list bosing."
     )
 
+@dp.message(Command("list"))
+async def list_movies(message: Message):
+    await send_movie_list(message.chat.id, page=0, reply_to=message)
 
-@bot.on_message(filters.command("list"))
-async def list_movies(client, message: Message, page: int = 0):
+async def send_movie_list(chat_id: int, page: int, reply_to: Message = None):
     try:
         count_res = supabase.table("movies").select("id", count="exact").eq("status", "published").execute()
-        total_count = count_res.count if count_res.count is not None else 0
+        total_count = count_res.count or 0
 
         offset = page * MOVIES_PER_PAGE
         response = supabase.table("movies").select("id, title").eq("status", "published").order("created_at", desc=True).range(offset, offset + MOVIES_PER_PAGE - 1).execute()
         movies = response.data
 
         if not movies:
-            await message.reply_text("Hozircha filmlar mavjud emas.")
+            if reply_to:
+                await reply_to.answer("Hozircha filmlar mavjud emas.")
             return
 
         movie_text = f"🎬 **Katalog ({page + 1}-sahifa)**\n\n"
         for i, movie in enumerate(movies):
             movie_text += f"{i + 1}. **{movie['title']}**\n"
-
         movie_text += "\nKo'rish uchun raqamni tanlang yoki boshqalarni ko'rish uchun o'qlardan foydalaning:"
+
         markup = get_movies_markup(page, total_count, movies)
-        await message.reply_text(movie_text, reply_markup=markup)
+        if reply_to:
+            await reply_to.answer(movie_text, reply_markup=markup)
     except Exception as e:
-        await message.reply_text("❌ Katalogni yuklashda xatolik yuz berdi.")
+        print(f"List error: {e}")
+        if reply_to:
+            await reply_to.answer("❌ Katalogni yuklashda xatolik yuz berdi.")
 
+@dp.message(Command("admin"))
+async def admin_cmd(message: Message):
+    args = message.text.split()
+    if len(args) > 1 and args[1] == ADMIN_PASSWORD:
+        admin_states[message.from_user.id] = {"is_admin": True, "step": "menu"}
+        await message.answer("✅ Admin tizimga kirdi! Yangi film qo'shish uchun /addmovie buyrug'ini bosing.")
+    else:
+        await message.answer("❌ Ruxsat berilmadi. Foydalanish: `/admin parolingiz`")
 
-@bot.on_callback_query(filters.regex("^page_"))
-async def handle_pagination(client, callback_query: CallbackQuery):
+@dp.message(Command("addmovie"))
+async def add_movie_start(message: Message):
+    user_id = message.from_user.id
+    if user_id not in admin_states or not admin_states[user_id].get("is_admin"):
+        await message.answer("❌ Avval /admin parolingiz orqali tizimga kiring.")
+        return
+    admin_states[user_id]["step"] = "awaiting_title"
+    await message.answer("📝 **Film qo'shish**\n\n1-bosqich: Film nomini yuboring (masalan: 'Avatar')")
+
+@dp.message(Command("cancel"))
+async def cancel_flow(message: Message):
+    user_id = message.from_user.id
+    if user_id in admin_states:
+        admin_states[user_id]["step"] = "menu"
+    await message.answer("🛑 Bekor qilindi. Admin menyusiga qaytilmoqda.")
+
+# --- CALLBACK HANDLERS ---
+
+@dp.callback_query(F.data.startswith("page_"))
+async def handle_pagination(callback_query: CallbackQuery):
     page = int(callback_query.data.split("_")[1])
     try:
         count_res = supabase.table("movies").select("id", count="exact").eq("status", "published").execute()
-        total_count = count_res.count
+        total_count = count_res.count or 0
         offset = page * MOVIES_PER_PAGE
         response = supabase.table("movies").select("id, title").eq("status", "published").order("created_at", desc=True).range(offset, offset + MOVIES_PER_PAGE - 1).execute()
         movies = response.data
@@ -98,105 +160,61 @@ async def handle_pagination(client, callback_query: CallbackQuery):
         movie_text += "\nKo'rish uchun raqamni tanlang yoki boshqalarni ko'rish uchun o'qlardan foydalaning:"
 
         markup = get_movies_markup(page, total_count, movies)
-        await callback_query.edit_message_text(movie_text, reply_markup=markup)
-    except:
+        await callback_query.message.edit_text(movie_text, reply_markup=markup)
+    except Exception as e:
         await callback_query.answer("Sahifani yuklab bo'lmadi.")
 
-
-async def send_movie_package(client, chat_id, movie):
-    if movie.get("post_message_id"):
-        await client.forward_messages(chat_id=chat_id, from_chat_id=CHANNEL_ID, message_ids=int(movie["post_message_id"]))
-
-    buttons = []
-    if movie.get("telegram_message_id"):
-        buttons.append([InlineKeyboardButton("📺 To'liq ko'rish (MKV)", callback_data=f"full_{movie['id']}")])
-    if movie.get("sample_message_id"):
-        buttons.append([InlineKeyboardButton("🎞 Namunani ko'rish", callback_data=f"sample_{movie['id']}")])
-
-    markup = InlineKeyboardMarkup(buttons)
-    await client.send_message(chat_id=chat_id, text=f"🍿 **{movie['title']}**\n\nQuyidagi variantlardan birini tanlang:", reply_markup=markup)
-
-
-@bot.on_callback_query(filters.regex("^select_"))
-async def handle_selection(client, callback_query: CallbackQuery):
+@dp.callback_query(F.data.startswith("select_"))
+async def handle_selection(callback_query: CallbackQuery):
     movie_id = callback_query.data.split("_")[1]
     await callback_query.answer("Tayyorlanmoqda...")
     try:
         response = supabase.table("movies").select("*").eq("id", movie_id).single().execute()
         movie = response.data
         if movie:
-            await send_movie_package(client, callback_query.message.chat.id, movie)
+            await send_movie_package(callback_query.message.chat.id, movie)
     except Exception as e:
-        print(f"Selection Error: {e}")
+        print(f"Selection error: {e}")
 
-
-@bot.on_callback_query(filters.regex("^full_"))
-async def handle_full_request(client, callback_query: CallbackQuery):
+@dp.callback_query(F.data.startswith("full_"))
+async def handle_full_request(callback_query: CallbackQuery):
     movie_id = callback_query.data.split("_")[1]
     await callback_query.answer("Film yuborilmoqda...")
     try:
         response = supabase.table("movies").select("telegram_message_id").eq("id", movie_id).single().execute()
         movie = response.data
         if movie and movie.get("telegram_message_id"):
-            await client.forward_messages(chat_id=callback_query.message.chat.id, from_chat_id=CHANNEL_ID, message_ids=int(movie["telegram_message_id"]))
+            await bot.forward_message(chat_id=callback_query.message.chat.id, from_chat_id=CHANNEL_ID, message_id=int(movie["telegram_message_id"]))
     except Exception as e:
-        print(f"Full Video Error: {e}")
+        print(f"Full video error: {e}")
 
-
-@bot.on_callback_query(filters.regex("^sample_"))
-async def handle_sample_request(client, callback_query: CallbackQuery):
+@dp.callback_query(F.data.startswith("sample_"))
+async def handle_sample_request(callback_query: CallbackQuery):
     movie_id = callback_query.data.split("_")[1]
     await callback_query.answer("Namuna yuborilmoqda...")
     try:
         response = supabase.table("movies").select("sample_message_id").eq("id", movie_id).single().execute()
         movie = response.data
         if movie and movie.get("sample_message_id"):
-            await client.forward_messages(chat_id=callback_query.message.chat.id, from_chat_id=CHANNEL_ID, message_ids=int(movie["sample_message_id"]))
+            await bot.forward_message(chat_id=callback_query.message.chat.id, from_chat_id=CHANNEL_ID, message_id=int(movie["sample_message_id"]))
     except Exception as e:
-        print(f"Sample Error: {e}")
+        print(f"Sample error: {e}")
 
+# --- TEXT HANDLER (admin flow + search) ---
 
-@bot.on_message(filters.command("admin"))
-async def admin_cmd(client, message: Message):
-    args = message.text.split()
-    if len(args) > 1 and args[1] == os.getenv("ADMIN_PASSWORD"):
-        admin_states[message.from_user.id] = {"is_admin": True, "step": "menu"}
-        await message.reply_text("✅ Admin tizimga kirdi! Yangi film qo'shish uchun /addmovie buyrug'ini bosing.")
-    else:
-        await message.reply_text("❌ Ruxsat berilmadi. Foydalanish: `/admin parolingiz`")
-
-
-@bot.on_message(filters.command("addmovie"))
-async def add_movie_start(client, message: Message):
-    user_id = message.from_user.id
-    if user_id not in admin_states or not admin_states[user_id].get("is_admin"):
-        await message.reply_text("❌ Avval /admin parolingiz orqali tizimga kiring.")
-        return
-    admin_states[user_id]["step"] = "awaiting_title"
-    await message.reply_text("📝 **Film qo'shish**\n\n1-bosqich: Film nomini yuboring (masalan: 'Avatar')")
-
-
-@bot.on_message(filters.command("cancel"))
-async def cancel_flow(client, message: Message):
-    user_id = message.from_user.id
-    if user_id in admin_states:
-        admin_states[user_id]["step"] = "menu"
-        await message.reply_text("🛑 Bekor qilindi. Admin menyusiga qaytilmoqda.")
-
-
-@bot.on_message(filters.text & ~filters.command([]))
-async def handle_all_text(client, message: Message):
+@dp.message(F.text)
+async def handle_all_text(message: Message):
     user_id = message.from_user.id
     state = admin_states.get(user_id)
     text = message.text.strip()
 
     if state and state.get("step") != "menu":
-        step = state.get("step")
+        step = state["step"]
 
         if step == "awaiting_title":
             state["title"] = text
             state["step"] = "awaiting_post_link"
-            await message.reply_text(f"✅ Nom o'rnatildi: **{text}**\n\n2-bosqich: Post linkini yuboring (masalan: https://t.me/channel/1)")
+            await message.answer(f"✅ Nom o'rnatildi: **{text}**\n\n2-bosqich: Post linkini yuboring (masalan: https://t.me/channel/1)")
 
         elif step == "awaiting_post_link":
             msg_id = parse_tg_link(text)
@@ -204,23 +222,23 @@ async def handle_all_text(client, message: Message):
                 state["post_message_id"] = msg_id
                 state["telegram_post_url"] = text
                 state["step"] = "awaiting_sample_link"
-                await message.reply_text(f"✅ Post linki qabul qilindi (ID: {msg_id})\n\n3-bosqich: Namuna video linkini yuboring (yoki 'yo'q' deb yozing)")
+                await message.answer(f"✅ Post linki qabul qilindi (ID: {msg_id})\n\n3-bosqich: Namuna video linkini yuboring (yoki 'yo'q' deb yozing)")
             else:
-                await message.reply_text("❌ Link formati noto'g'ri. Iltimos shunday link yuboring: `https://t.me/channel/123`")
+                await message.answer("❌ Link formati noto'g'ri. Iltimos shunday link yuboring: `https://t.me/channel/123`")
 
         elif step == "awaiting_sample_link":
             if text.lower() in ["yo'q", "yoq", "none"]:
                 state["sample_message_id"] = None
                 state["step"] = "awaiting_mkv_link"
-                await message.reply_text("⏩ Namuna o'tkazib yuborildi.\n\n4-bosqich: Asosiy video (MKV) linkini yuboring")
+                await message.answer("⏩ Namuna o'tkazib yuborildi.\n\n4-bosqich: Asosiy video (MKV) linkini yuboring")
             else:
                 msg_id = parse_tg_link(text)
                 if msg_id:
                     state["sample_message_id"] = msg_id
                     state["step"] = "awaiting_mkv_link"
-                    await message.reply_text(f"✅ Namuna linki qabul qilindi (ID: {msg_id})\n\n4-bosqich: Asosiy video (MKV) linkini yuboring")
+                    await message.answer(f"✅ Namuna linki qabul qilindi (ID: {msg_id})\n\n4-bosqich: Asosiy video (MKV) linkini yuboring")
                 else:
-                    await message.reply_text("❌ Link formati noto'g'ri.")
+                    await message.answer("❌ Link formati noto'g'ri.")
 
         elif step == "awaiting_mkv_link":
             msg_id = parse_tg_link(text)
@@ -236,27 +254,50 @@ async def handle_all_text(client, message: Message):
                         "status": "published"
                     }
                     supabase.table("movies").insert(movie_data).execute()
-                    await message.reply_text(f"🎉 **Muvaffaqiyatli!** '**{state['title']}**' filmi qo'shildi va e'lon qilindi.")
+                    await message.answer(f"🎉 **Muvaffaqiyatli!** '**{state['title']}**' filmi qo'shildi va e'lon qilindi.")
                     state["step"] = "menu"
                 except Exception as e:
-                    await message.reply_text(f"❌ Ma'lumotlar bazasiga saqlashda xatolik: {e}")
+                    await message.answer(f"❌ Ma'lumotlar bazasiga saqlashda xatolik: {e}")
             else:
-                await message.reply_text("❌ Link formati noto'g'ri.")
+                await message.answer("❌ Link formati noto'g'ri.")
         return
 
-    # User search
-    await message.reply_text(f"🔍 **{text}** qidirilmoqda...")
+    # Search
+    await message.answer(f"🔍 **{text}** qidirilmoqda...")
     try:
         response = supabase.table("movies").select("*").ilike("title", f"%{text}%").eq("status", "published").execute()
         movies = response.data
         if movies:
-            await send_movie_package(bot, message.chat.id, movies[0])
+            await send_movie_package(message.chat.id, movies[0])
         else:
-            await message.reply_text("🔍 Film topilmadi. Mavjud filmlarni ko'rish uchun /list bosing.")
+            await message.answer("🔍 Film topilmadi. Mavjud filmlarni ko'rish uchun /list bosing.")
     except Exception as e:
-        await message.reply_text("❌ Qidiruvda xatolik yuz berdi.")
+        await message.answer("❌ Qidiruvda xatolik yuz berdi.")
 
+# --- FASTAPI ROUTES ---
+
+@app.on_event("startup")
+async def on_startup():
+    webhook_url = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+    await bot.set_webhook(webhook_url)
+    print(f"🚀 Webhook set to: {webhook_url}")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    await bot.delete_webhook()
+    await bot.session.close()
+
+@app.post(WEBHOOK_PATH)
+async def webhook(request: Request):
+    from aiogram.types import Update
+    update = Update.model_validate(await request.json(), context={"bot": bot})
+    await dp.feed_update(bot, update)
+    return Response(status_code=200)
+
+@app.get("/")
+async def root():
+    return {"status": "healthy", "bot": "CineStream"}
 
 if __name__ == "__main__":
-    print("🚀 Bot started (polling)...")
-    bot.run()
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
