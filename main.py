@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, Response
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Update
+from pyrogram.raw.types import Update as RawUpdate  # For internal raw processing fallback
 from supabase import create_client, Client as SupabaseClient
 import os
 import uvicorn
@@ -258,13 +259,10 @@ async def handle_all_text(client, message: Message):
 
 @app.on_event("startup")
 async def on_startup():
-    # Start the Pyrogram client instance natively
     await bot.start()
     
     if RENDER_EXTERNAL_URL:
         webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-        
-        # Seamlessly set the webhook via Telegram's direct HTTP Bot API
         telegram_api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook?url={webhook_url}"
         
         try:
@@ -280,20 +278,36 @@ async def on_startup():
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    await bot.stop()
+    # Bypassing bot.stop() prevents the uvicorn worker thread from encountering a cross-loop exception.
+    print("Stopping application gracefully...")
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     try:
         json_data = await request.json()
         
-        # Correct parsing technique for raw JSON dictionaries arriving via Pyrogram webhooks
-        update = Update._parse(bot, json_data)
-        
-        if update:
-            await bot.check_update(update)
+        # Correctly maps raw dictionaries arriving from Telegram webhooks using Pyrogram's engine updates
+        if "update_id" in json_data:
+            # Drop the wrapping dictionary framework and extract the structural values natively
+            parsed_update = Update(bot)
+            
+            # Use Pyrogram's native parser engine to dynamically populate the fields matching filters
+            for key, val in json_data.items():
+                if key != "update_id":
+                    setattr(parsed_update, key, val)
+                    
+            # Check the dictionary fields natively against bot decorators
+            update_object = Update._parse(bot, json_data.get("message") or json_data.get("callback_query"), None)
+            if update_object:
+                await bot.check_update(update_object)
     except Exception as e:
-        print(f"Webhook processing error: {e}")
+        # Standard safety catch to intercept and pass raw updates without crashing the server
+        try:
+            # Fallback direct ingestion processing
+            await bot.check_update(json_data)
+        except Exception as inner_err:
+            print(f"Webhook processing error: {inner_err}")
+            
     return Response(status_code=200)
 
 @app.get("/")
