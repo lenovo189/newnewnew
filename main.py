@@ -6,6 +6,7 @@ import os
 import uvicorn
 from dotenv import load_dotenv
 import requests
+
 # Load environment variables
 load_dotenv(dotenv_path=".env.local")
 
@@ -285,8 +286,12 @@ async def on_shutdown():
 async def telegram_webhook(request: Request):
     try:
         json_data = await request.json()
-        update = Update.read(json_data)
-        await bot.check_update(update)
+        
+        # Correct parsing technique for raw JSON dictionaries arriving via Pyrogram webhooks
+        update = Update._parse(bot, json_data)
+        
+        if update:
+            await bot.check_update(update)
     except Exception as e:
         print(f"Webhook processing error: {e}")
     return Response(status_code=200)
